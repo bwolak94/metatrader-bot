@@ -63,6 +63,24 @@ input double   InpTrailStepATR      = 0.5;         // Trailing: krok (× ATR)
 input bool     InpUseBreakEven      = true;        // Break-Even koszyka
 input double   InpBE_TriggerATR     = 1.5;         // Break-Even: trigger (× ATR)
 
+// --- Szybkie zamykanie pozycji (FAST EXIT)
+input group "=== SZYBKIE ZAMYKANIE POZYCJI ==="
+input bool     InpUseFixedProfitTarget  = true;    // Zamknij przy stałym zysku $
+input double   InpProfitTarget1_USD     = 25.0;    // Poziom 1: zamknij 50% pozycji ($)
+input double   InpProfitTarget2_USD     = 45.0;    // Poziom 2: zamknij kolejne 30% ($)
+input double   InpProfitTarget3_USD     = 70.0;    // Poziom 3: zamknij resztę ($)
+input bool     InpUseTrailingProfit     = true;    // Trailing profit (zabezpiecz zysk od szczytu)
+input double   InpTrailProfit_Start_USD = 20.0;    // Trailing profit: aktywacja od ($)
+input double   InpTrailProfit_Pullback  = 40.0;    // Trailing profit: cofnięcie od szczytu (%)
+input bool     InpUseReversalExit       = true;    // Zamknij przy sygnale odwrócenia
+input int      InpReversal_RSI_Period   = 5;       // Reversal: RSI szybki (okres)
+input double   InpReversal_RSI_Long     = 65.0;    // Reversal: RSI BUY — zamknij gdy > X
+input double   InpReversal_RSI_Short    = 35.0;    // Reversal: RSI SELL — zamknij gdy < X
+input int      InpReversal_Candles      = 2;       // Reversal: ile świec przeciwnych = wyjście
+input bool     InpUsePanicClose         = true;    // Panic close: natychmiastowe zamknięcie
+input double   InpPanicClose_Profit_USD = 15.0;    // Panic: zamknij WSZYSTKO gdy zysk koszyka > $X i spada
+input double   InpPanicClose_Drawback   = 35.0;    // Panic: % spadku od szczytu koszyka → zamknij
+
 // --- Ochrona kapitału
 input group "=== OCHRONA KAPITALU ==="
 input double   InpMaxDailyLoss      = 5.0;         // Max dzienna strata (% balansu)
@@ -189,6 +207,16 @@ int            g_labelHandles[];
 
 // Magic numbers per pozycja
 ulong          g_magicBase = 202600;
+
+// Śledzenie szczytowego zysku (Fast Exit)
+struct PosExitState {
+   ulong    ticket;
+   double   peakProfit;       // najwyższy zysk jaki osiągnęła pozycja
+   bool     partial1Done;     // czy zamknięto 50% przy target1
+   bool     partial2Done;     // czy zamknięto 30% przy target2
+   bool     beSet;            // czy ustawiono break-even po partial1
+};
+PosExitState   g_exitStates[];  // tablica stanów dla każdej pozycji
 
 //+------------------------------------------------------------------+
 //|  OnInit                                                          |
@@ -793,70 +821,279 @@ void ExecuteTrade(TradeSignal &sig) {
 }
 
 //+------------------------------------------------------------------+
-//|  ZARZĄDZANIE OTWARTYMI POZYCJAMI                                 |
+//|  HELPER: znajdź lub utwórz stan pozycji w tablicy g_exitStates  |
+//+------------------------------------------------------------------+
+int FindOrCreateExitState(ulong ticket) {
+   for(int i = 0; i < ArraySize(g_exitStates); i++) {
+      if(g_exitStates[i].ticket == ticket) return i;
+   }
+   int sz = ArraySize(g_exitStates);
+   ArrayResize(g_exitStates, sz + 1);
+   g_exitStates[sz].ticket       = ticket;
+   g_exitStates[sz].peakProfit   = 0.0;
+   g_exitStates[sz].partial1Done = false;
+   g_exitStates[sz].partial2Done = false;
+   g_exitStates[sz].beSet        = false;
+   return sz;
+}
+
+//+------------------------------------------------------------------+
+//|  HELPER: zamknięcie częściowe pozycji (partial close)            |
+//+------------------------------------------------------------------+
+bool PartialClose(ulong ticket, double closePct, string reason) {
+   if(!g_position.SelectByTicket(ticket)) return false;
+   double currentLot = g_position.Volume();
+   double stepLot    = SymbolInfoDouble(g_symbol, SYMBOL_VOLUME_STEP);
+   double closeLot   = MathFloor(currentLot * closePct / stepLot) * stepLot;
+   if(closeLot < InpMinLot) closeLot = InpMinLot;
+   if(closeLot >= currentLot) {
+      // zamknij całość
+      bool ok = g_trade.PositionClose(ticket);
+      if(ok) Print("[PARTIAL→FULL CLOSE] ", reason, " ticket:", ticket, " lot:", currentLot);
+      return ok;
+   }
+   bool ok = g_trade.PositionClosePartial(ticket, closeLot);
+   if(ok) Print("[PARTIAL CLOSE] ", reason, " ticket:", ticket,
+               " lot:", closeLot, "/", currentLot, " (", closePct*100, "%)");
+   return ok;
+}
+
+//+------------------------------------------------------------------+
+//|  HELPER: szybki RSI do detekcji odwrócenia                       |
+//+------------------------------------------------------------------+
+double GetFastRSI() {
+   int hRSI = iRSI(g_symbol, InpTF_Entry, InpReversal_RSI_Period, PRICE_CLOSE);
+   if(hRSI == INVALID_HANDLE) return 50.0;
+   double buf[2];
+   if(CopyBuffer(hRSI, 0, 0, 2, buf) < 2) { IndicatorRelease(hRSI); return 50.0; }
+   IndicatorRelease(hRSI);
+   return buf[1];
+}
+
+//+------------------------------------------------------------------+
+//|  HELPER: liczba przeciwnych świec (sygnał odwrócenia)            |
+//+------------------------------------------------------------------+
+int CountReversalCandles(int direction) {
+   // Liczy świece zamknięte przeciwnie do kierunku pozycji
+   int count = 0;
+   for(int i = 1; i <= InpReversal_Candles + 1; i++) {
+      double o = iOpen(g_symbol,  InpTF_Main, i);
+      double c = iClose(g_symbol, InpTF_Main, i);
+      if(direction == 1  && c < o) count++; // BUY → bearish candle
+      if(direction == -1 && c > o) count++; // SELL → bullish candle
+   }
+   return count;
+}
+
+//+------------------------------------------------------------------+
+//|  ZARZĄDZANIE OTWARTYMI POZYCJAMI — wersja Fast Exit v2.1         |
 //+------------------------------------------------------------------+
 
 void ManageOpenPositions() {
    double atr[2];
    if(CopyBuffer(g_hATR_Main, 0, 0, 2, atr) < 2) return;
-   double atrVal = atr[1];
+   double atrVal   = atr[1];
+   double fastRSI  = GetFastRSI();
 
+   // ── MODUŁ PANIC CLOSE: ocenia cały koszyk łącznie ───────────────
+   if(InpUsePanicClose) {
+      double basketProfit = 0.0;
+      double basketPeak   = 0.0;
+      for(int i = 0; i < PositionsTotal(); i++) {
+         if(!g_position.SelectByIndex(i)) continue;
+         if(g_position.Symbol() != g_symbol || g_position.Magic() != g_magicBase) continue;
+         basketProfit += g_position.Profit();
+         int idx = FindOrCreateExitState(g_position.Ticket());
+         basketPeak   += g_exitStates[idx].peakProfit;
+      }
+      // Jeśli koszyk był na zysku > $X i teraz stracił > Y% od szczytu → zamknij wszystko
+      if(basketPeak >= InpPanicClose_Profit_USD && basketProfit > 0) {
+         double drawbackPct = (basketPeak - basketProfit) / basketPeak * 100.0;
+         if(drawbackPct >= InpPanicClose_Drawback) {
+            Print("[PANIC CLOSE] Koszyk cofnął się o ", DoubleToString(drawbackPct,1),
+                  "% od szczytu $", DoubleToString(basketPeak,2),
+                  " → bieżący $", DoubleToString(basketProfit,2));
+            CloseAllPositions("PANIC_BASKET_DRAWBACK");
+            return;
+         }
+      }
+   }
+
+   // ── PĘTLA PER POZYCJA ────────────────────────────────────────────
    for(int i = PositionsTotal() - 1; i >= 0; i--) {
       if(!g_position.SelectByIndex(i)) continue;
       if(g_position.Symbol() != g_symbol) continue;
       if(g_position.Magic() != g_magicBase) continue;
 
+      ulong  ticket    = g_position.Ticket();
       double openPrice = g_position.PriceOpen();
       double sl        = g_position.StopLoss();
       double tp        = g_position.TakeProfit();
-      double curPrice  = (g_position.PositionType() == POSITION_TYPE_BUY)
+      double curLot    = g_position.Volume();
+      int    posType   = (int)g_position.PositionType(); // 0=BUY, 1=SELL
+      int    direction = (posType == POSITION_TYPE_BUY) ? 1 : -1;
+      double curPrice  = (direction == 1)
                          ? SymbolInfoDouble(g_symbol, SYMBOL_BID)
                          : SymbolInfoDouble(g_symbol, SYMBOL_ASK);
       double profit    = g_position.Profit();
-      ulong  ticket    = g_position.Ticket();
 
-      // --- Break-Even
-      if(InpUseBreakEven) {
-         double beTrigger = atrVal * InpBE_TriggerATR;
-         if(g_position.PositionType() == POSITION_TYPE_BUY) {
-            if(curPrice >= openPrice + beTrigger && sl < openPrice) {
-               double newSL = openPrice + g_point * 2;
-               newSL = NormalizeDouble(newSL, g_digits);
-               if(newSL > sl)
-                  g_trade.PositionModify(ticket, newSL, tp);
+      int idx = FindOrCreateExitState(ticket);
+
+      // Aktualizuj szczytowy zysk
+      if(profit > g_exitStates[idx].peakProfit)
+         g_exitStates[idx].peakProfit = profit;
+      double peakProfit = g_exitStates[idx].peakProfit;
+
+      // ════════════════════════════════════════════════════════════════
+      // MECHANIZM 1: FIXED PROFIT TARGET + PARTIAL CLOSE
+      // Zamknij 50% przy $25 → break-even → zamknij 30% przy $45 → resztę przy $70
+      // ════════════════════════════════════════════════════════════════
+      if(InpUseFixedProfitTarget) {
+
+         // TARGET 3: zamknij resztę przy $70
+         if(!g_exitStates[idx].partial2Done && profit >= InpProfitTarget3_USD) {
+            if(PartialClose(ticket, 1.0, "TARGET3_" + DoubleToString(InpProfitTarget3_USD,0) + "USD")) {
+               UpdateStats_Close(profit);
+               continue; // pozycja zamknięta — przejdź dalej
             }
-         } else {
-            if(curPrice <= openPrice - beTrigger && sl > openPrice) {
-               double newSL = openPrice - g_point * 2;
-               newSL = NormalizeDouble(newSL, g_digits);
-               if(newSL < sl)
-                  g_trade.PositionModify(ticket, newSL, tp);
+         }
+
+         // TARGET 2: zamknij kolejne 30% przy $45
+         if(g_exitStates[idx].partial1Done && !g_exitStates[idx].partial2Done
+            && profit >= InpProfitTarget2_USD) {
+            if(PartialClose(ticket, 0.30, "TARGET2_" + DoubleToString(InpProfitTarget2_USD,0) + "USD")) {
+               g_exitStates[idx].partial2Done = true;
+            }
+         }
+
+         // TARGET 1: zamknij 50% przy $25 + natychmiast ustaw break-even
+         if(!g_exitStates[idx].partial1Done && profit >= InpProfitTarget1_USD) {
+            if(PartialClose(ticket, 0.50, "TARGET1_" + DoubleToString(InpProfitTarget1_USD,0) + "USD")) {
+               g_exitStates[idx].partial1Done = true;
+               // Natychmiastowy break-even po partial close
+               if(!g_exitStates[idx].beSet) {
+                  double beSL = (direction == 1)
+                                ? openPrice + g_point * 3
+                                : openPrice - g_point * 3;
+                  beSL = NormalizeDouble(beSL, g_digits);
+                  bool beOk = false;
+                  if(direction == 1 && beSL > sl) beOk = g_trade.PositionModify(ticket, beSL, tp);
+                  if(direction == -1 && (beSL < sl || sl == 0)) beOk = g_trade.PositionModify(ticket, beSL, tp);
+                  if(beOk) {
+                     g_exitStates[idx].beSet = true;
+                     Print("[BE SET] Po partial1 ustawiono break-even ticket:", ticket,
+                           " SL:", beSL);
+                  }
+               }
             }
          }
       }
 
-      // --- Trailing Stop
+      // ════════════════════════════════════════════════════════════════
+      // MECHANIZM 2: TRAILING PROFIT (zabezpieczenie zysku od szczytu)
+      // Aktywuje się gdy profit > $20, zamyka gdy cofnie się o 40% od szczytu
+      // ════════════════════════════════════════════════════════════════
+      if(InpUseTrailingProfit && peakProfit >= InpTrailProfit_Start_USD && profit > 0) {
+         double pullback = (peakProfit - profit) / peakProfit * 100.0;
+         if(pullback >= InpTrailProfit_Pullback) {
+            Print("[TRAIL PROFIT] Cofnięcie: ", DoubleToString(pullback,1),
+                  "% od szczytu $", DoubleToString(peakProfit,2),
+                  " | bieżący zysk: $", DoubleToString(profit,2));
+            if(PartialClose(ticket, 1.0, "TRAIL_PROFIT_PULLBACK")) {
+               UpdateStats_Close(profit);
+               continue;
+            }
+         }
+      }
+
+      // ════════════════════════════════════════════════════════════════
+      // MECHANIZM 3: REVERSAL EXIT (wyjście przy sygnale odwrócenia)
+      // Zamknij gdy szybki RSI wskazuje przegrzanie + N świec przeciwnych
+      // ════════════════════════════════════════════════════════════════
+      if(InpUseReversalExit && profit > 0) {
+         bool rsiReversal   = false;
+         bool candleReversal = (CountReversalCandles(direction) >= InpReversal_Candles);
+
+         if(direction == 1  && fastRSI > InpReversal_RSI_Long)  rsiReversal = true;
+         if(direction == -1 && fastRSI < InpReversal_RSI_Short) rsiReversal = true;
+
+         if(rsiReversal && candleReversal) {
+            Print("[REVERSAL EXIT] RSI:", DoubleToString(fastRSI,1),
+                  " + ", InpReversal_Candles, " świec przeciwnych",
+                  " | zysk: $", DoubleToString(profit,2));
+            if(g_exitStates[idx].partial1Done) {
+               // Jeśli już zamknięto połowę — zamknij resztę
+               if(PartialClose(ticket, 1.0, "REVERSAL_REST")) {
+                  UpdateStats_Close(profit);
+                  continue;
+               }
+            } else {
+               // Zamknij 60% i ustaw agresywny trailing na resztę
+               if(PartialClose(ticket, 0.60, "REVERSAL_60PCT")) {
+                  g_exitStates[idx].partial1Done = true;
+                  // Agresywny break-even
+                  double beSL = (direction == 1)
+                                ? openPrice + g_point * 3
+                                : openPrice - g_point * 3;
+                  beSL = NormalizeDouble(beSL, g_digits);
+                  if(direction == 1 && beSL > sl)            g_trade.PositionModify(ticket, beSL, tp);
+                  if(direction == -1 && (beSL < sl || sl==0)) g_trade.PositionModify(ticket, beSL, tp);
+                  g_exitStates[idx].beSet = true;
+               }
+            }
+         }
+      }
+
+      // ════════════════════════════════════════════════════════════════
+      // MECHANIZM 4: KLASYCZNY BREAK-EVEN (ATR-based, pierwotny)
+      // Aktywuje się jako uzupełnienie — zabezpiecza gdy żaden target nie zadziałał
+      // ════════════════════════════════════════════════════════════════
+      if(InpUseBreakEven && !g_exitStates[idx].beSet) {
+         double beTrigger = atrVal * InpBE_TriggerATR;
+         bool   triggered = false;
+         double beSL      = 0;
+
+         if(direction == 1 && curPrice >= openPrice + beTrigger && sl < openPrice) {
+            beSL = openPrice + g_point * 2;
+            triggered = true;
+         }
+         if(direction == -1 && curPrice <= openPrice - beTrigger && (sl > openPrice || sl == 0)) {
+            beSL = openPrice - g_point * 2;
+            triggered = true;
+         }
+         if(triggered) {
+            beSL = NormalizeDouble(beSL, g_digits);
+            bool ok = false;
+            if(direction == 1  && beSL > sl)            ok = g_trade.PositionModify(ticket, beSL, tp);
+            if(direction == -1 && (beSL < sl || sl==0)) ok = g_trade.PositionModify(ticket, beSL, tp);
+            if(ok) {
+               g_exitStates[idx].beSet = true;
+               Print("[ATR BE] Break-even ustawiony ticket:", ticket, " SL:", beSL);
+            }
+         }
+      }
+
+      // ════════════════════════════════════════════════════════════════
+      // MECHANIZM 5: KLASYCZNY TRAILING STOP (ATR-based)
+      // Dorabia po break-even — utrzymuje pozycję jeśli trend kontynuuje
+      // ════════════════════════════════════════════════════════════════
       if(InpUseTrailing) {
          double trailActivate = atrVal * InpTrailActivateATR;
          double trailStep     = atrVal * InpTrailStepATR;
 
-         if(g_position.PositionType() == POSITION_TYPE_BUY) {
-            if(curPrice >= openPrice + trailActivate) {
-               double newSL = curPrice - trailStep;
-               newSL = NormalizeDouble(newSL, g_digits);
-               if(newSL > sl + g_point)
-                  g_trade.PositionModify(ticket, newSL, tp);
-            }
-         } else {
-            if(curPrice <= openPrice - trailActivate) {
-               double newSL = curPrice + trailStep;
-               newSL = NormalizeDouble(newSL, g_digits);
-               if(newSL < sl - g_point || sl == 0)
-                  g_trade.PositionModify(ticket, newSL, tp);
-            }
+         if(direction == 1 && curPrice >= openPrice + trailActivate) {
+            double newSL = NormalizeDouble(curPrice - trailStep, g_digits);
+            if(newSL > sl + g_point)
+               g_trade.PositionModify(ticket, newSL, tp);
+         }
+         if(direction == -1 && curPrice <= openPrice - trailActivate) {
+            double newSL = NormalizeDouble(curPrice + trailStep, g_digits);
+            if(newSL < sl - g_point || sl == 0)
+               g_trade.PositionModify(ticket, newSL, tp);
          }
       }
-   }
+
+   } // koniec pętli per pozycja
 }
 
 //+------------------------------------------------------------------+
@@ -1103,6 +1340,17 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
    ENUM_DEAL_ENTRY entry_type = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
    if(entry_type == DEAL_ENTRY_OUT || entry_type == DEAL_ENTRY_INOUT) {
       UpdateStats_Close(profit);
+      // Wyczyść stan exit dla zamkniętej pozycji
+      ulong posTicket = HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
+      for(int k = 0; k < ArraySize(g_exitStates); k++) {
+         if(g_exitStates[k].ticket == posTicket) {
+            // Usuń element z tablicy (przesuń pozostałe)
+            int sz = ArraySize(g_exitStates);
+            for(int m = k; m < sz - 1; m++) g_exitStates[m] = g_exitStates[m+1];
+            ArrayResize(g_exitStates, sz - 1);
+            break;
+         }
+      }
       Print("[DEAL CLOSED] Profit: ", profit,
             " WinRate: ", DoubleToString(g_stats.winRate, 1), "%",
             " PF: ", DoubleToString(g_stats.profitFactor, 2));
@@ -1119,19 +1367,31 @@ void UpdateDashboard(string statusMsg) {
    double balance = g_account.Balance();
    double dailyPnL = equity - g_dailyStartBalance;
 
-   string lines[10];
-   lines[0] = "╔══ HybridAlpha2026 ══╗";
-   lines[1] = StringFormat("║ Symbol : %-10s ║", g_symbol);
-   lines[2] = StringFormat("║ Equity : %10.2f ║", equity);
-   lines[3] = StringFormat("║ DayPnL : %+10.2f ║", dailyPnL);
-   lines[4] = StringFormat("║ Pozycje: %-3d / %-3d   ║", CountOpenPositions(), InpMaxPositions);
-   lines[5] = StringFormat("║ WinRate: %-6.1f%%     ║", g_stats.winRate);
-   lines[6] = StringFormat("║ PFactor: %-8.2f   ║", g_stats.profitFactor);
-   lines[7] = StringFormat("║ Trades : %-5d       ║", g_stats.totalTrades);
-   lines[8] = statusMsg != "" ? StringFormat("║ %-20s ║", statusMsg) : "║                     ║";
-   lines[9] = "╚═════════════════════╝";
+   // Policz łączny zysk otwartych pozycji i szczytowy zysk koszyka
+   double openProfit = 0, peakBasket = 0;
+   for(int j = 0; j < PositionsTotal(); j++) {
+      if(!g_position.SelectByIndex(j)) continue;
+      if(g_position.Symbol() != g_symbol || g_position.Magic() != g_magicBase) continue;
+      openProfit += g_position.Profit();
+      int idx = FindOrCreateExitState(g_position.Ticket());
+      peakBasket += g_exitStates[idx].peakProfit;
+   }
 
-   for(int i = 0; i < 10; i++) {
+   string lines[12];
+   lines[0]  = "╔══ HybridAlpha2026 ══╗";
+   lines[1]  = StringFormat("║ Symbol : %-10s ║", g_symbol);
+   lines[2]  = StringFormat("║ Equity : %10.2f ║", equity);
+   lines[3]  = StringFormat("║ DayPnL : %+10.2f ║", dailyPnL);
+   lines[4]  = StringFormat("║ OpenP&L: %+10.2f ║", openProfit);
+   lines[5]  = StringFormat("║ PeakP&L: %+10.2f ║", peakBasket);
+   lines[6]  = StringFormat("║ Pozycje: %-3d / %-3d   ║", CountOpenPositions(), InpMaxPositions);
+   lines[7]  = StringFormat("║ WinRate: %-6.1f%%     ║", g_stats.winRate);
+   lines[8]  = StringFormat("║ PFactor: %-8.2f   ║", g_stats.profitFactor);
+   lines[9]  = StringFormat("║ Trades : %-5d       ║", g_stats.totalTrades);
+   lines[10] = statusMsg != "" ? StringFormat("║ %-20s ║", StringSubstr(statusMsg,0,20)) : "║                     ║";
+   lines[11] = "╚═════════════════════╝";
+
+   for(int i = 0; i < 12; i++) {
       string name = "HA_Panel_" + IntegerToString(i);
       if(ObjectFind(0, name) < 0) {
          ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
@@ -1142,13 +1402,18 @@ void UpdateDashboard(string statusMsg) {
          ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 9);
          ObjectSetString(0,  name, OBJPROP_FONT, "Courier New");
       }
+      // Kolor: czerwony gdy bot wyłączony, żółty gdy blisko limitu
+      color labelColor = clrAqua;
+      if(g_botDisabledToday) labelColor = clrRed;
+      else if(dailyPnL < -(g_dailyStartBalance * InpMaxDailyLoss / 100.0 * 0.7)) labelColor = clrYellow;
+      ObjectSetInteger(0, name, OBJPROP_COLOR, labelColor);
       ObjectSetString(0, name, OBJPROP_TEXT, lines[i]);
    }
    ChartRedraw(0);
 }
 
 void CleanDashboard() {
-   for(int i = 0; i < 10; i++) {
+   for(int i = 0; i < 12; i++) {
       string name = "HA_Panel_" + IntegerToString(i);
       if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
    }
